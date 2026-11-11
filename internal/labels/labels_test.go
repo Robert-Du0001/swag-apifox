@@ -44,6 +44,71 @@ func TestFullwidthPunctuation(t *testing.T) {
 	}
 }
 
+// 括号里的补充说明要么整段保留、要么整段丢掉，不能只剩半个括号。
+// 之前 reAlt 的字符类排除了右括号 ）却放过了左括号 （，于是
+// "2 读写（默认）" 被截成 "读写（默认"。
+func TestBalancedParentheses(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want map[string]string
+	}{
+		{
+			name: "全角括号整段保留",
+			text: "受邀者初始权限：1 完整 / 2 读写（默认）/ 3 只读",
+			want: map[string]string{"1": "完整", "2": "读写（默认）", "3": "只读"},
+		},
+		{
+			name: "括号内的分隔符不断开标签",
+			text: "权限：1 完全 / 2 读写 / 3 只读（0 = 不改；管理员永远是 1）",
+			want: map[string]string{"1": "完全", "2": "读写", "3": "只读（0 = 不改；管理员永远是 1）"},
+		},
+		{
+			name: "ASCII 括号同样处理",
+			text: "状态：1 启用(默认), 2 停用",
+			want: map[string]string{"1": "启用(默认)", "2": "停用"},
+		},
+		{
+			name: "嵌套括号按层级配对",
+			text: "状态：1 启用（含子项（二级））/ 2 停用",
+			want: map[string]string{"1": "启用（含子项（二级））", "2": "停用"},
+		},
+		{
+			name: "未闭合的左括号整段丢弃",
+			text: "状态：1 启用（默认",
+			want: map[string]string{"1": "启用"},
+		},
+		{
+			name: "没有配对的右括号仍是终点",
+			text: "状态：1 启用）后续",
+			want: map[string]string{"1": "启用"},
+		},
+		{
+			name: "括号后的句号不进标签",
+			text: "权限：1 完全 / 2 读写 / 3 只读（管理员恒为 1）。",
+			want: map[string]string{"1": "完全", "2": "读写", "3": "只读（管理员恒为 1）"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Parse(tc.text, false)
+			for v, want := range tc.want {
+				if got.Get(v) != want {
+					t.Errorf("value %s = %q, want %q (all: %#v)", v, got.Get(v), want, got.M)
+				}
+			}
+		})
+	}
+}
+
+func TestStringEnumBalancedParentheses(t *testing.T) {
+	got := Parse("排序方式：ASC-升序（默认），DESC-降序", true)
+	if got.Get("ASC") != "升序（默认）" || got.Get("DESC") != "降序" {
+		t.Fatalf("labels = %#v (keys %#v)", got.M, got.Keys)
+	}
+}
+
 func TestStringEnumsOptIn(t *testing.T) {
 	text := "排序方式：ASC-升序，DESC-降序；OEM：zm-众马"
 	if got := Parse(text, false); got.Len() != 0 {
