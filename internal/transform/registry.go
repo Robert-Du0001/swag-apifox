@@ -71,6 +71,11 @@ type Registry struct {
 
 func NewRegistry(cfg Config) *Registry {
 	r := &Registry{}
+	// example runs first: it rewrites x-example into example, so a block that
+	// is also x-nullable keeps its example when nullable rebuilds it.
+	if cfg.Enable["example"] {
+		r.Register(&ParamExample{})
+	}
 	if cfg.Enable["enum"] {
 		r.Register(&ApifoxEnum{cfg: cfg})
 	}

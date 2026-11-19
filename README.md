@@ -3,15 +3,34 @@
 一个**独立的命令行应用**：读取 [swag v2](https://github.com/swaggo/swag/tree/v2) 生成的 OpenAPI 3.1 文档，按扩展规则做二次处理，产出可直接导入 [Apifox](https://apifox.com/) 的 YAML。
 
 它位于 `Go 源码 → swag → swag-apifox → Apifox` 这条链路的中间，不绑定任何业务项目，也不改动 swag 本身的行为。
+真正把产物推到 Apifox 的那一步，由仓库自带的 [配套 Skill](#配套-skill同步到-apifox) 完成。
+
+## 目录
+
+- [解决什么问题](#解决什么问题)
+- [特性](#特性)
+- [运行环境要求](#运行环境要求)
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [配套 Skill：同步到 Apifox](#配套-skill同步到-apifox)
+- [命令与参数](#命令与参数)
+- [做了哪些转换](#做了哪些转换)
+- [扩展新的 Apifox 字段](#扩展新的-apifox-字段)
+- [测试](#测试)
+- [已知边界](#已知边界)
+- [发版](#发版)
+
+---
 
 ## 解决什么问题
 
-swag v2 生成的 OpenAPI 3.1 里，有两处信息 Apifox 用不上：
+swag v2 生成的 OpenAPI 3.1 里，有三处信息 Apifox 用不上：
 
 | swag 的输出 | 问题 | 本工具生成 |
 | --- | --- | --- |
 | `x-nullable: true` | Apifox 更认 `type: 'null'`，`any` 字段被当成普通类型 | 保留描述性键 + `type: 'null'` |
 | `enum` + `x-enum-varnames` + `x-enum-comments` | 枚举项的中文说明在 Apifox 里不显示 | `x-apifox-enum`（`value` / `name` / `description`） |
+| `x-example` | swag 丢弃数组的 `example()`，只能靠参数扩展带出示例 | 改名成 `example`，`[a,b]` 展开成 YAML 列表 |
 
 此外还能从字段注释、`@Param ... Enums(...)`、中文说明（`1-禁用，2-启用`、`+ 日常收支：1`）、query 参数父级 description、`$ref` 指向的 schema 等位置补全枚举标签。
 
@@ -23,6 +42,7 @@ swag v2 生成的 OpenAPI 3.1 里，有两处信息 Apifox 用不上：
 - 幂等：对已处理的文档重复运行，结果逐字节不变
 - **实时透传 swag 输出并着色**（进度青 / 提示黄 / 错误红），解析大项目时不会像卡死；`--color` 可控制，`NO_COLOR` / 重定向自动关色
 - 转换规则拆成可插拔的 transformer，后续增加更多 `x-apifox-*` 字段只需加一个实现
+- 仓库自带配套 Skill：一条命令完成「生成 → 导入 Apifox → 刷新模型与接口元数据」
 
 ---
 
@@ -63,13 +83,28 @@ cd swag-apifox
 go install ./...          # 装到 $(go env GOPATH)/bin/swag-apifox[.exe]
 ```
 
-也可以只构建二进制：
+也可以只构建二进制。**推荐用 `build.sh`，它显式把 git tag 写进版本号**（在 CI 只做 shallow clone、或从源码包构建等没有完整 git 历史的场景也能生效）：
 
 ```sh
-go build -o swag-apifox .
+bash ./build.sh                      # -> ./swag-apifox[.exe]，版本取自 git describe --tags
+bash ./build.sh bin/swag-apifox.exe  # 自定义输出路径
 ```
 
-> `go install <module>@latest` 要求仓库已推送到 GitHub 并打了语义化 tag（如 `v0.1.0`）；未发版前请用 `go install ./...`。
+不跑脚本时也可以手动注入（PowerShell 里 `$(...)` 同样可用）：
+
+```sh
+go build -ldflags "-X github.com/Robert-Du0001/swag-apifox/cmd.Version=$(git describe --tags --always --dirty)" -o swag-apifox.exe .
+```
+
+`--version` / `-v` 的版本号按以下优先级解析，源码里不再硬编码版本号，发版无需改 Go 代码：
+
+| 优先级 | 来源 | 典型结果 |
+| --- | --- | --- |
+| 1 | 构建时 `-ldflags -X ...cmd.Version=...`（`bash ./build.sh` 用 `git describe --tags --always --dirty`） | `v1.0.1`、`v1.0.1-2-gabcdef-dirty` |
+| 2 | Go 工具链写入二进制的模块版本：`go install <module>@vX.Y.Z` 是 tag 本身；在完整 git 仓库里直接 `go build` / `go install ./...` 也会按最近 tag 自动推导 | `v1.0.1`、`v1.0.1+dirty` |
+| 3 | 无 git 仓库 / 无 tag / `-buildvcs=false` 时回退 | `dev` |
+
+> `go install <module>@latest` 要求仓库已推送到 GitHub 并打了语义化 tag（如 `v1.0.1`）；未发版前请用 `go install ./...`。第 2 条的自动推导依赖本地存在 `.git` 与 tag，发布流水线里建议统一走 `bash ./build.sh` 或 `go install <module>@<tag>`。
 
 ## 快速开始
 
@@ -92,6 +127,55 @@ cat docs/swagger.yaml | swag-apifox process -i - > docs/openapi.yaml
 
 `build` 会把 swag 的原始输出写进系统临时目录，`docs/swagger.yaml` 不会成为交付物；成功后默认删除它（`--keep-swagger` 可保留）。swag 在**项目根**执行，这样 `.swaggo` 里的类型映射与 `main.go` 的通用注解才能生效。
 
+## 配套 Skill：同步到 Apifox
+
+本工具只负责**生成**文档。把 `docs/openapi.yaml` 推到 Apifox 的那一步，由仓库自带的
+`skills/swag-apifox-sync/` 完成，两者拼成完整链路：
+
+```text
+Go 源码（@Param / DTO 注解）
+   │  swag init --v3.1 --ot yaml
+   ▼
+swag-apifox（本工具，纯文本行级后处理）
+   │  docs/openapi.yaml
+   ▼
+swag-apifox-sync skill（Node.js 脚本，只用内置模块）
+   │  生成 → 校验 sha256 → 导入 → 刷新模型/接口元数据
+   ▼
+Apifox 项目
+```
+
+**安装**：把技能目录整个复制到 WorkBuddy 的技能目录，重启会话后生效。
+
+```sh
+# macOS / Linux
+cp -r skills/swag-apifox-sync ~/.workbuddy/skills/
+
+# Windows PowerShell
+Copy-Item -Recurse -Force skills\swag-apifox-sync "$env:USERPROFILE\.workbuddy\skills\"
+```
+
+只想给某个项目的成员共享时，改为放到该项目的 `.workbuddy/skills/` 下，作为项目级技能。
+
+**前置条件**：Node.js 18+、已通过 `apifox auth login --with-token <令牌>` 登录、知道目标项目 ID。
+项目 ID **必须显式传入**（脚本不内置默认值，避免误传到别的项目）：
+
+```sh
+node ~/.workbuddy/skills/swag-apifox-sync/scripts/pipeline.mjs --project <项目 ID>
+# 等价写法：APIFOX_PROJECT_ID=<项目 ID> node ~/.workbuddy/skills/swag-apifox-sync/scripts/pipeline.mjs
+```
+
+在 Windows PowerShell 里把 `~` 换成 `$env:USERPROFILE`；也可以直接给 `pipeline.mjs` 传绝对路径。
+
+脚本会重新跑一遍 `swag-apifox build`，记下 yaml 的 sha256 后才开始导入；同步阶段只读 yaml，
+任何手工修改或格式化都会导致中止。除了导入，它还会：
+
+- 刷新数据模型的字段差异（最小改动，不删字段）；
+- 刷新接口名称、说明、响应说明和参数定义——`import-data` 对已存在接口只会忽略，靠这一步补齐；
+- 比对已有参数的 `type` / `description` / 枚举 / `schema.example`，包括上面 `x-example` 转出的数组示例。
+
+完整用法、参数表与排错记录见 `skills/swag-apifox-sync/SKILL.md`。
+
 ## 命令与参数
 
 | 命令        | 说明                    |
@@ -105,7 +189,7 @@ cat docs/swagger.yaml | swag-apifox process -i - > docs/openapi.yaml
 | `-o, --out`             | build: `docs/openapi.yaml`；process: `-`(stdout) | 相对 `--root`；绝对路径原样使用；`-` 表示 stdout                                  |
 | `-i, --input`           | `-`                                             | 仅 `process`：输入文件或 `-`(stdin)                                        |
 | `--enum-label-field`    | `description`                                   | 中文标签写进 `x-apifox-enum` 的 `description` / `name` / `both`            |
-| `--enable`              | `enum,nullable`                                 | 启用的 transformer（可重复）                                                |
+| `--enable`              | `example,enum,nullable`                         | 启用的 transformer（可重复）                                                |
 | `--swag`                | `swag`                                          | 仅 `build`：swag 可执行文件（PATH 名或绝对路径）                                  |
 | `-- <swag 参数>`         | 无                                               | 仅 `build`：`--` 之后的全部内容原样交给 `swag init`；不传即只跑基础命令                     |
 | `--skip-swag`           | 关                                               | 仅 `build`：不跑 swag，按 `docs/swagger.yaml` → `docs/openapi.yaml` 取已有文档 |
@@ -115,7 +199,7 @@ cat docs/swagger.yaml | swag-apifox process -i - > docs/openapi.yaml
 | `--quiet`               | 关                                               | 静默 swag 输出与统计块                                                       |
 | `--verbose`             | 关                                               | 额外打印实际执行的完整 swag 命令行                                                 |
 | `--color`               | `auto`                                          | 着色模式：`auto` / `always` / `never`（见「输出与颜色」）                          |
-| `--version`             | —                                               | 版本号                                                                 |
+| `-v, --version`         | —                                               | 版本号：优先用构建时由 git tag 注入的值，其次用 Go 工具链写入的模块版本（即 tag），无 git 信息时显示 `dev`（详见「安装」） |
 
 ### 输出与颜色
 
@@ -185,9 +269,18 @@ swag-apifox build -- "--exclude './vendor dir' --parseDepth 1"
    - 没有对应开头的 `）`/`)` 视为终点（它属于标签外面的文字）；扫描到文本结尾还留着未闭合的 `（` 时，**左括号及其后的内容整段丢弃**（`1 启用（默认` → `启用`）。
 
    也就是说括号里的补充说明只有「整段保留」和「整段丢弃」两种结果，不会出现 `读写（默认` 这种半个括号。
-4. **幂等剥离**：每次运行先删掉上一轮生成的 `x-apifox-enum` 块（保留 `enum:`），再重新生成。
+4. **`x-example` → `example`**：swag 的 `example()` 对数组/对象类型直接丢弃（`defineType` 不认 array），参数扩展却能留下，所以 `extensions(x-example=[a,b])` 会出现在参数的 `schema` 里。工具把它改名成 `example`，方括号形式展开成 YAML 列表，数组参数也能有示例：
+   ```yaml
+   schema:
+     type: array
+     example:
+     - '2026-10-01'
+     - '2026-10-31'
+   ```
+   方括号不只是语法糖：`splitNotWrapped` 只在括号内保留逗号，没有它扩展会被拆成多个键。
+5. **幂等剥离**：每次运行先删掉上一轮生成的 `x-apifox-enum` 块（保留 `enum:`），再重新生成。
 
-默认启用 `enum` 与 `nullable` 两个 transformer。Apifox 导出里还有 `x-apifox-name`、`x-apifox-ordering`、`x-apifox-mock`、`x-apifox-orders`、`x-apifox-refs` 等字段，可按下面的方式扩展。
+默认启用 `example`、`enum`、`nullable` 三个 transformer。Apifox 导出里还有 `x-apifox-name`、`x-apifox-ordering`、`x-apifox-mock`、`x-apifox-orders`、`x-apifox-refs` 等字段，可按下面的方式扩展。
 
 ## 扩展新的 Apifox 字段
 
@@ -205,7 +298,7 @@ type Transformer interface {
 
 1. 在 `internal/transform/` 新建文件实现接口，`Strip` 只删自己生成的行，`Apply` 只收集 `document.Edit`（`Order` 与已有规则错开）；
 2. 在 `NewRegistry` 里注册，并在 `runner.Config.Validate` 的 `known` 表加入名字；
-3. 用 `--enable <name>` 启用（默认不启用，避免影响既有产物的字节一致性）。
+3. 用 `--enable <name>` 启用；是否进 `Defaults` 的默认列表，取决于它会不会改变现有项目的产物（`example` 只在出现 `x-example` 时才动手，所以默认开）。
 
 `document` 包只提供行模型、缩进、节点索引、标量格式化与「倒序应用编辑」，**不要**引入 YAML 解析库重新序列化整份文档——那会破坏键顺序和引号风格。
 
@@ -219,7 +312,7 @@ go test ./...
 
 - `internal/document`：BOM / CRLF / 尾部空行、节点索引、`$ref` 与「列表项与 key 同缩进」、标量格式化、块标量 description、编辑倒序应用。
 - `internal/labels`：三种中文枚举说明写法、汉字闸门（日期/金额不误判）、全角标点、括号配对（整段保留 / 未闭合丢弃 / 嵌套 / 括号内分隔符）、字符串枚举开关、父级回看 8 行。
-- `internal/transform`：三个 Step、label 三态、幂等、剥离规则。
+- `internal/transform`：三个 Step、label 三态、幂等、剥离规则、`x-example` 数组展开与类型保留。
 - `internal/runner`：端到端流水线、`--enum-label-field`、`--strict` 的异常检测、`--` 参数规范化与 swag 命令拼装、输出行缓冲与着色分级、`--color` 模式与环境变量。
 
 想验证升级后产物不变，可以自己留一份已生成的 YAML 当基准，不需要把大文件放进仓库（比对时要传与生成基准时**相同**的 `--` 参数，否则参数不同产物自然不同）：
@@ -234,12 +327,15 @@ diff -u <基准文件> /tmp/candidate.yaml
 - 输入是 **swag v2 在 `--v3.1 --ot yaml` 下的产物**；换 swag 版本或输出格式后，用上面的 `diff` 命令重新确认缩进假设。
 - 默认只输出 YAML；JSON 输出暂不支持。
 - 默认只识别数字型枚举值，`--string-enums` 打开后才解析字符串值（且会改变产物字节）。
-- 默认只生成 `x-apifox-enum` / `type: 'null'` 两类扩展；其余 `x-apifox-*` 通过 transformer 扩展。
+- 默认生成 `x-apifox-enum`、`type: 'null'` 和 `example`（由 `x-example` 转来）三类内容；其余 `x-apifox-*` 通过 transformer 扩展。
 
 ## 发版
 
 - 确认 `go.mod` 的 module 与 GitHub 仓库地址一致（当前 `github.com/Robert-Du0001/swag-apifox`）。
-- 打语义化 tag（如 `v0.1.0`）之后 `go install github.com/Robert-Du0001/swag-apifox@latest` 才可用。
+- 打语义化 tag（如 `v1.0.1`）之后 `go install github.com/Robert-Du0001/swag-apifox@latest` 才可用；该命令装出的二进制版本号就是 tag 本身，无需任何额外参数。
+- 发本地/发布用二进制推荐 `bash ./build.sh`，版本号由 `git describe --tags --always --dirty` 生成：在干净的 tag 提交上是 `v1.0.1`，之后是 `v1.0.1-2-gabcdef`，工作区有改动再加 `-dirty`。
+- 直接在完整 git 仓库里 `go build` 也能带上 tag（Go 工具链写入 `v1.0.1`、`v1.0.1+dirty`），但 shallow clone / 源码包等无 tag 信息的环境会退化成 `dev`，所以发布统一走前两条路径。
+- 不要在源码里改版本号；`cmd.Version` 保持为空，由构建链路注入。
 
 ## License
 

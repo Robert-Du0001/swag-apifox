@@ -37,7 +37,7 @@ func (c *Config) Defaults() {
 		c.Swag = "swag"
 	}
 	if len(c.Enable) == 0 {
-		c.Enable = []string{"enum", "nullable"}
+		c.Enable = []string{"example", "enum", "nullable"}
 	}
 	if c.Color == "" {
 		c.Color = ColorAuto
@@ -60,7 +60,7 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("invalid --color %q (want auto, always or never)", c.Color)
 	}
-	known := map[string]bool{"enum": true, "nullable": true}
+	known := map[string]bool{"example": true, "enum": true, "nullable": true}
 	for _, name := range c.Enable {
 		if !known[name] {
 			return fmt.Errorf("unknown transformer %q in --enable", name)

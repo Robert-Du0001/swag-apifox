@@ -113,3 +113,88 @@ func TestStripOnlyRemovesApifoxBlock(t *testing.T) {
 		t.Fatalf("enum values were damaged:\n%s", text)
 	}
 }
+
+func exampleConfig() Config {
+	return Config{EnumLabelField: "description", Enable: map[string]bool{"example": true}}
+}
+
+func TestParamExampleArrayBecomesList(t *testing.T) {
+	lines := []string{
+		"        schema:",
+		"          items:",
+		"            type: string",
+		"          type: array",
+		"          x-example: '[2026-10-01,2026-10-31]'",
+		"        style: form",
+	}
+	d, _ := runTransform(t, lines, exampleConfig())
+	// The example stays where x-example was: swag already sorted the keys,
+	// and re-sorting would only churn the diff.
+	want := strings.Join([]string{
+		"        schema:",
+		"          items:",
+		"            type: string",
+		"          type: array",
+		"          example:",
+		"          - '2026-10-01'",
+		"          - '2026-10-31'",
+		"        style: form",
+	}, "\n")
+	if d.Text() != want {
+		t.Fatalf("got://n%s//nwant://n%s", d.Text(), want)
+	}
+}
+
+func TestParamExampleScalarKeepsType(t *testing.T) {
+	lines := []string{
+		"          type: array",
+		"          x-example: '[1,2]'",
+		"        style: form",
+	}
+	d, _ := runTransform(t, lines, exampleConfig())
+	text := d.Text()
+	if !strings.Contains(text, "          - 1\n          - 2") {
+		t.Fatalf("numeric items must stay numbers:/n%s", text)
+	}
+
+	d, _ = runTransform(t, []string{"        x-example: DESC"}, exampleConfig())
+	if got := d.Text(); got != "        example: 'DESC'" {
+		t.Fatalf("scalar: got %q", got)
+	}
+
+	d, _ = runTransform(t, []string{"        x-example: 1"}, exampleConfig())
+	if got := d.Text(); got != "        example: 1" {
+		t.Fatalf("numeric scalar: got %q", got)
+	}
+}
+
+func TestParamExampleKeepsRealExample(t *testing.T) {
+	lines := []string{
+		"        schema:",
+		"          example: real",
+		"          type: string",
+		"          x-example: ignored",
+	}
+	d, _ := runTransform(t, lines, exampleConfig())
+	want := strings.Join([]string{
+		"        schema:",
+		"          example: real",
+		"          type: string",
+	}, "\n")
+	if d.Text() != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", d.Text(), want)
+	}
+}
+
+func TestParamExampleIsIdempotent(t *testing.T) {
+	lines := []string{
+		"        schema:",
+		"          type: array",
+		"          x-example: '[a,b]'",
+	}
+	first, _ := runTransform(t, lines, exampleConfig())
+	second, _ := runTransform(t, first.Lines, exampleConfig())
+	if first.Text() != second.Text() {
+		t.Fatalf("not idempotent:/nfirst:/n%s/nsecond:/n%s", first.Text(), second.Text())
+	}
+}

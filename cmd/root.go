@@ -4,12 +4,37 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
+	"strings"
 
 	"github.com/Robert-Du0001/swag-apifox/internal/runner"
 	"github.com/spf13/cobra"
 )
 
-var Version = "0.1.0"
+// Version holds the version reported by --version/-v. It is deliberately
+// empty in source control so that cutting a release never requires editing Go
+// code. It is resolved, in order, from:
+//
+//  1. a build-time injection, e.g. with build.sh:
+//     go build -ldflags "-X github.com/Robert-Du0001/swag-apifox/cmd.Version=$(git describe --tags --always --dirty)"
+//  2. the module version embedded by the Go toolchain: the exact git tag for
+//     `go install github.com/Robert-Du0001/swag-apifox@v1.0.1`, and a
+//     tag-derived value such as v1.0.1+dirty for a local build in a git repo;
+//  3. "dev" when neither is available (no VCS info, e.g. -buildvcs=false).
+var Version = ""
+
+// resolvedVersion returns the version string to expose on the root command.
+func resolvedVersion() string {
+	if v := strings.TrimSpace(Version); v != "" {
+		return v
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return "dev"
+}
 
 var cfg runner.Config
 
@@ -19,7 +44,7 @@ var rootCmd = &cobra.Command{
 	Long:          "swag-apifox runs swag v2 and applies text-level fixes to its OpenAPI 3.1 YAML:\nx-nullable -> type: 'null', and enum metadata -> x-apifox-enum.\nIt never re-serializes the document, so swag's indentation, key order and quoting survive.",
 	SilenceUsage:  true,
 	SilenceErrors: true,
-	Version:       Version,
+	Version:       resolvedVersion(),
 }
 
 func init() {
