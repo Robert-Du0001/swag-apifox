@@ -35,6 +35,7 @@ const ALIAS = { p: 'project', f: 'file', c: 'config' };
 const FLAGS = new Set([
   'verify-only', 'dry-run', 'help', 'refresh-schemas', 'no-refresh-schemas',
   'refresh-apis', 'no-refresh-apis',
+  'refresh-env', 'no-refresh-env',
   'no-generate', 'generate-only', 'quiet', 'keep-swagger',
 ]);
 const VALUE_KEYS = new Set([
@@ -73,6 +74,8 @@ const USAGE = `用法:
       --no-refresh-apis     不改接口元数据（import 对已存在接口一律忽略）
       --apis <list>         只刷新指定接口，格式 "get /path"（逗号分隔）
       --max-apis <n>        单次最多刷新多少个接口（默认 50）
+      --refresh-env         按 openapi.yaml 的 servers 同步环境前置 URL（默认开启）
+      --no-refresh-env      不碰环境配置
       --verify-only         只校验令牌与项目 ID（不生成、不导入）
       --dry-run             生成照做，但不同步、不发送请求
   -h, --help                显示帮助
@@ -656,6 +659,24 @@ function parseFormDataExamples(lines, start) {
   return out;
 }
 
+// swag 为重复状态码生成 oneOf：解析 schema 下的 $ref 列表，供 Apifox 响应结构同步使用。
+function parseResponseOneOf(lines, start) {
+  const refs = [];
+  let j = start + 1;
+  while (j < lines.length) {
+    const l = lines[j];
+    if (!l.trim()) { j++; continue; }
+    if (indentOf(l) <= 14) break;
+    const m = l.trim().match(/^-\s*\$ref:\s*['"]?(.+?)['"]?\s*$/);
+    if (m) {
+      const name = refName(m[1]);
+      if (name) refs.push(name);
+    }
+    j++;
+  }
+  return { refs, next: j };
+}
+
 function parseLocalOperations(yaml) {
   const lines = yaml.split(/\r?\n/);
   const ops = new Map();
@@ -679,7 +700,7 @@ function parseLocalOperations(yaml) {
     const mm = line.match(/^ {4}(get|post|put|patch|delete|head|options):\s*$/);
     if (mm && curPath) {
       flush();
-      curOp = { method: mm[1], path: curPath, name: '', description: '', responses: {}, parameters: [], formExamples: new Map() };
+      curOp = { method: mm[1], path: curPath, name: '', description: '', responses: {}, responseSchemas: {}, parameters: [], formExamples: new Map(), oasEnum: [] };
       continue;
     }
     if (!curOp) continue;
@@ -693,6 +714,25 @@ function parseLocalOperations(yaml) {
       if (key[1] === 'summary') curOp.name = s.value;
       else curOp.description = s.value;
       i = s.next - 1;
+      continue;
+    }
+    // operation 级 enum（swag-apifox 旧版会误把接口描述里的 200/400 生成到这里）。
+    // 正常文档不应有；采集它用于和 Apifox 的 oasExtensions 比对并清掉历史残留。
+    if (indent === 6 && key[1] === 'enum') {
+      const vals = [];
+      let j = i + 1;
+      while (j < lines.length) {
+        const st = lines[j].trim();
+        if (!st) { j++; continue; }
+        if (indentOf(lines[j]) === 6 && /^-\s*/.test(st)) {
+          vals.push(yamlTypedScalar(st.replace(/^-\s*/, '')));
+          j++;
+          continue;
+        }
+        break;
+      }
+      curOp.oasEnum = vals;
+      i = j - 1;
       continue;
     }
     if (indent === 6 && key[1] === 'parameters') {
@@ -720,6 +760,12 @@ function parseLocalOperations(yaml) {
           j++;
           continue;
         }
+        if (ind === 14 && code && /^schema:/.test(l.trim())) {
+          const s = parseResponseOneOf(lines, j);
+          if (s.refs.length > 1) curOp.responseSchemas[code] = { oneOf: s.refs };
+          j = s.next;
+          continue;
+        }
         if (ind === 10 && code && /^description:/.test(l.trim())) {
           const s = readScalarAt(lines, j, ind);
           curOp.responses[code] = s.value;
@@ -745,6 +791,46 @@ const refName = (ref) => {
   return m ? m[1] : '';
 };
 
+// swag v2 的 example(...) 只能写在参数上，无法生成响应示例。
+// 这里按本地 components.schemas 的属性示例递归拼出响应示例，供 Apifox 的
+// responseExamples 使用；只用于 swag 生成 oneOf（同一状态码多种返回）的接口。
+function exampleByType(type, enums = []) {
+  if (enums.length) return enums[0];
+  switch (String(type || '')) {
+    case 'null': return null;
+    case 'integer':
+    case 'number': return 0;
+    case 'boolean': return false;
+    case 'array': return [];
+    case 'object': return {};
+    default: return 'string';
+  }
+}
+
+function buildSchemaExample(name, schemas, seen = new Set()) {
+  const info = schemas.get(name);
+  if (!info || seen.has(name)) return null; // 循环引用不再展开
+  seen.add(name);
+  const out = {};
+  for (const prop of info.propOrder || []) {
+    const spec = info.props.get(prop) || {};
+    if (spec.example !== undefined) { out[prop] = spec.example; continue; }
+    if (spec.ref) {
+      out[prop] = buildSchemaExample(refName(spec.ref), schemas, seen);
+      continue;
+    }
+    if (spec.itemsRef) {
+      const item = buildSchemaExample(refName(spec.itemsRef), schemas, seen);
+      out[prop] = [item === null ? exampleByType(spec.itemsType) : item];
+      continue;
+    }
+    if (spec.itemsType) { out[prop] = [exampleByType(spec.itemsType)]; continue; }
+    out[prop] = exampleByType(spec.type, spec.enumValues);
+  }
+  seen.delete(name);
+  return out;
+}
+
 function quickDiffers(local, remoteSchema) {
   const props = remoteSchema?.properties || {};
   const remoteNames = Object.keys(props);
@@ -760,7 +846,9 @@ function quickDiffers(local, remoteSchema) {
     const spec = local.props.get(name);
     if (!spec.ref && spec.type && props[name]?.type !== spec.type) return true;
     if (spec.example === undefined) continue;
-    const want = Array.isArray(spec.example) ? spec.example : [spec.example];
+    // examples 存的是「示例列表」，数组示例本身要作为一个整体元素，不能拆平。
+    // 例如 example:[1,2]（array 类型的一个示例）应写 examples:[[1,2]]，而非 examples:[1,2]。
+    const want = [spec.example];
     if (JSON.stringify(props[name]?.examples) !== JSON.stringify(want)) return true;
     if (spec.enumValues.length && JSON.stringify(props[name]?.enum) !== JSON.stringify(spec.enumValues)) return true;
     if (spec.apifoxEnum && JSON.stringify(props[name]?.['x-apifox-enum']) !== JSON.stringify(spec.apifoxEnum)) return true;
@@ -846,7 +934,8 @@ function planUpdate(local, remote, nameToId) {
       patched.push(`${name} 说明`);
     }
     if (spec.example !== undefined) {
-      const want = Array.isArray(spec.example) ? spec.example : [spec.example];
+      // 数组示例整体作为一个元素，不能拆平：example:[1,2] → examples:[[1,2]]。
+      const want = [spec.example];
       if (JSON.stringify(clone.examples) !== JSON.stringify(want)) {
         clone.examples = want;
         patched.push(`${name} 示例`);
@@ -1086,19 +1175,43 @@ function paramDelta(existing, want) {
 
 // 只「补」不「清」：本地没有写的字段（未加 @Description / @Summary）保留线上内容，
 // 避免把在 Apifox 上手工补过的说明冲成空。
+// Apifox 把 operation 级 OpenAPI 扩展存在 oasExtensions（JSON 字符串）。
+// 只关心 enum / x-apifox-enum 两个键：本地不该有 enum 时，清掉线上历史误生成的。
+function remoteOasEnum(remote) {
+  const raw = remote?.oasExtensions;
+  if (!raw) return [];
+  let obj;
+  try { obj = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return []; }
+  if (!obj || typeof obj !== 'object') return [];
+  return Array.isArray(obj.enum) ? obj.enum : [];
+}
+
 function apiMetaDiff(op, remote) {
   const diffs = [];
   const addedParams = [];
   if (op.name && op.name !== (remote.name || '')) diffs.push(`名称「${remote.name || '(空)'}」→「${op.name}」`);
   if (op.description && op.description !== (remote.description || '')) diffs.push('接口说明');
-  const remoteResp = new Map((remote.responses || []).map((r) => [String(r.code), r.description || '']));
+  const remoteEnum = remoteOasEnum(remote);
+  const localEnum = op.oasEnum || [];
+  if (JSON.stringify(remoteEnum) !== JSON.stringify(localEnum)) {
+    diffs.push(`扩展 enum（线上 ${JSON.stringify(remoteEnum)} → 本地 ${JSON.stringify(localEnum)}）`);
+  }
+  const remoteResp = new Map((remote.responses || []).map((r) => [String(r.code), r]));
   const respChanges = [];
+  const respNameChanges = [];
   for (const [code, desc] of Object.entries(op.responses || {})) {
     if (!desc) continue;
-    if (!remoteResp.has(code)) continue;
-    if (remoteResp.get(code) !== desc) {
+    const remoteItem = remoteResp.get(code);
+    if (!remoteItem) continue;
+    if ((remoteItem.description || '') !== desc) {
       respChanges.push({ code, desc });
       diffs.push(`响应 ${code} 说明`);
+    }
+    // Apifox 对部分状态码（如 409）没有内置中文响应名，name 为空时 tab/Mock 列表会显示空白。
+    // 本地 @Failure 的 description 是中文，只在 name 为空时用它补上，不覆盖已有名称。
+    if (!remoteItem.name && desc) {
+      respNameChanges.push({ code, name: desc });
+      diffs.push(`响应 ${code} 名称`);
     }
   }
   // 参数按 in + name 比对：本地没有的线上参数原样保留（只补不清），
@@ -1136,11 +1249,19 @@ function apiMetaDiff(op, remote) {
     diffs.push(`formData:${name} 示例`);
   }
 
-  return { diffs, respChanges, addedParams, paramChanges, formChanges };
+  return { diffs, respChanges, respNameChanges, addedParams, paramChanges, formChanges };
 }
 
-async function refreshApis({ base, project, headers, timeout, ops, opts, only }) {
+async function refreshApis({ base, project, headers, timeout, ops, schemas, opts, only }) {
   const remote = await fetchRemoteApis({ base, project, headers, timeout });
+  // oneOf 响应里的 $ref 用的是 swag 模型名，写入 Apifox 时必须换成它的定义 ID。
+  let nameToId = new Map();
+  try {
+    const schemas = await fetchRemoteSchemas({ base, project, headers, timeout });
+    nameToId = new Map([...schemas.entries()].map(([name, item]) => [name, item.id]));
+  } catch (err) {
+    console.warn(`[apis] 拉取模型映射失败，oneOf 响应结构将跳过：${err.message}`);
+  }
 
   let keys = [...ops.keys()].filter((k) => remote.has(k));
   if (only.length) {
@@ -1153,8 +1274,11 @@ async function refreshApis({ base, project, headers, timeout, ops, opts, only })
 
   const candidates = [];
   for (const k of keys) {
-    const { diffs, respChanges, addedParams, paramChanges } = apiMetaDiff(ops.get(k), remote.get(k));
-    if (diffs.length) candidates.push({ key: k, diffs, respChanges, addedParams, paramChanges });
+    const op = ops.get(k);
+    const { diffs, respChanges, respNameChanges, addedParams, paramChanges } = apiMetaDiff(op, remote.get(k));
+    // 带 oneOf 的接口即使元数据一致也要进候选，才能把响应结构写进 Apifox。
+    const hasOneOf = Object.values(op.responseSchemas || {}).some((s) => s?.oneOf?.length > 1);
+    if (diffs.length || hasOneOf) candidates.push({ key: k, diffs, respChanges, respNameChanges, addedParams, paramChanges, hasOneOf });
   }
   console.log(`[apis] 本地接口 ${ops.size} 个，Apifox 接口 ${remote.size} 个；待核对 ${candidates.length} 个`);
   if (!candidates.length) return { updated: 0, skipped: 0 };
@@ -1183,10 +1307,70 @@ async function refreshApis({ base, project, headers, timeout, ops, opts, only })
     const cur = detail.json.data || {};
     if (!cur.id) { skipped++; skips.push(`${c.key}：返回结构异常`); continue; }
 
+    // 只同步 swag 生成的 oneOf 响应（同一状态码多种返回）：结构与示例。其它响应一律保持线上不动。
+    const schemaChanges = [];
+    const schemaNotes = [];
+    let responseExamples = null; // null 表示本次不动线上示例
+    if (c.hasOneOf) {
+      for (const [code, s] of Object.entries(ops.get(c.key).responseSchemas || {})) {
+        if (!s.oneOf || s.oneOf.length < 2) continue;
+        const remoteResp = (cur.responses || []).find((r) => String(r.code) === code);
+        if (!remoteResp) continue;
+
+        const ids = s.oneOf.map((n) => nameToId.get(n));
+        if (ids.some((id) => !id)) {
+          console.warn(`[apis] ${c.key} 响应 ${code} 的 oneOf 模型未找到 Apifox 定义，跳过结构同步：${s.oneOf.join(', ')}`);
+        } else {
+          const wantRefs = ids.map((id) => `#/definitions/${id}`);
+          const gotRefs = ((remoteResp.jsonSchema || {}).oneOf || []).map((x) => x && x.$ref);
+          if (JSON.stringify(gotRefs) !== JSON.stringify(wantRefs)) {
+            schemaChanges.push({ code, jsonSchema: { oneOf: wantRefs.map((ref) => ({ $ref: ref })) } });
+            schemaNotes.push(`响应 ${code} 结构（${s.oneOf.join(' / ')}）`);
+          }
+        }
+
+        // 响应示例：swag v2 不生成，按本地模型属性示例拼出。按 oasKey 对齐、只补不清。
+        if (schemas && schemas.size && remoteResp.id) {
+          const want = s.oneOf.map((n) => ({
+            name: n,
+            responseId: remoteResp.id,
+            data: JSON.stringify(buildSchemaExample(n, schemas) ?? {}, null, 4),
+            description: '',
+            oasKey: n,
+            oasExtensions: '',
+          }));
+          const next = [...(responseExamples || (Array.isArray(cur.responseExamples) ? cur.responseExamples : []))];
+          let changed = false;
+          for (const e of want) {
+            const idx = next.findIndex((x) => x.oasKey === e.oasKey);
+            if (idx === -1) {
+              next.push({ ...e, id: crypto.randomUUID() });
+              changed = true;
+            } else if (next[idx].data !== e.data || String(next[idx].responseId) !== String(e.responseId)) {
+              next[idx] = { ...next[idx], ...e, id: next[idx].id };
+              changed = true;
+            }
+          }
+          if (changed) {
+            responseExamples = next;
+            schemaNotes.push(`响应 ${code} 示例 ${want.length} 个`);
+          }
+        }
+      }
+    }
+    // 元数据与响应结构/示例都无差异时不写回，避免每次执行都产生一次 PUT。
+    if (!c.diffs.length && !schemaChanges.length && !responseExamples) continue;
+
     const changed = new Map(c.respChanges.map((r) => [r.code, r.desc]));
-    const responses = (cur.responses || []).map((r) => (
-      changed.has(String(r.code)) ? { ...r, description: changed.get(String(r.code)) } : r
-    ));
+    const changedNames = new Map((c.respNameChanges || []).map((r) => [r.code, r.name]));
+    const schemaByCode = new Map(schemaChanges.map((s) => [s.code, s.jsonSchema]));
+    const responses = (cur.responses || []).map((r) => {
+      const code = String(r.code);
+      const out = changed.has(code) ? { ...r, description: changed.get(code) } : { ...r };
+      if (changedNames.has(code)) out.name = changedNames.get(code);
+      if (schemaByCode.has(code)) out.jsonSchema = schemaByCode.get(code);
+      return out;
+    });
 
     // 已有参数原样保留，只在对应 in 下追加本地新出现的参数
     const parameters = JSON.parse(JSON.stringify(cur.parameters || {}));
@@ -1225,6 +1409,26 @@ async function refreshApis({ base, project, headers, timeout, ops, opts, only })
       };
     }
 
+    // oasExtensions：只按本地文档同步 enum / x-apifox-enum，其它扩展键原样保留。
+    // 本地无 operation 级 enum 时，删掉线上这两把键，清掉旧版 transformer 误生成的残留。
+    let oasExtensions = cur.oasExtensions;
+    if (oasExtensions) {
+      let ext;
+      try { ext = typeof oasExtensions === 'string' ? JSON.parse(oasExtensions) : { ...oasExtensions }; }
+      catch { ext = null; }
+      if (ext && typeof ext === 'object') {
+        const localEnum = op.oasEnum || [];
+        if (localEnum.length) {
+          ext.enum = localEnum;
+          // x-apifox-enum 本地若没有则不臆造，交给 import 阶段；这里只保证 enum 值一致。
+        } else {
+          delete ext.enum;
+          delete ext['x-apifox-enum'];
+        }
+        oasExtensions = Object.keys(ext).length ? JSON.stringify(ext) : '';
+      }
+    }
+
     const body = JSON.stringify({
       name: op.name || cur.name,
       method: cur.method,
@@ -1234,11 +1438,13 @@ async function refreshApis({ base, project, headers, timeout, ops, opts, only })
       parameters,
       requestBody,
       responses,
+      responseExamples: responseExamples === null ? (cur.responseExamples || []) : responseExamples,
       status: cur.status,
       auth: cur.auth,
       securityScheme: cur.securityScheme,
       moduleId: cur.moduleId,
       folderId: cur.folderId,
+      oasExtensions,
     });
     const put = await request(`${base}/api/v1/projects/${project}/http-apis/${listed.id}`, {
       method: 'PUT', body, headers, timeout,
@@ -1249,11 +1455,161 @@ async function refreshApis({ base, project, headers, timeout, ops, opts, only })
       continue;
     }
     updated++;
-    console.log(`[apis] 已更新 ${c.key}：${c.diffs.join('；')}`);
+    console.log(`[apis] 已更新 ${c.key}：${[...c.diffs, ...schemaNotes].join('；')}`);
   }
 
   for (const s of skips) console.warn(`[apis] 跳过 ${s}`);
   console.log(`[apis] 完成：更新 ${updated} / 无需变更 ${candidates.length - updated - skipped} / 跳过 ${skipped}`);
+  return { updated, skipped };
+}
+
+// ---------------------------------------------------------------------------
+// 环境前置 URL 同步
+//
+// 权威数据源是 openapi.yaml 的 servers 块（来自 main.go 的 @servers.url /
+// @servers.description）：description 对应 Apifox 环境名，url 即该环境前置 URL。
+// 按环境名匹配后写入 baseUrl + baseUrls 全部键（含各模块键、0、default），
+// 与接口的 moduleId 无关，OpenAPI 导入新建的 moduleId=0 接口也能取到。
+// 本地文档没有 servers 时，兜底沿用「从已有模块 URL 复制」只补 0/default。
+// ---------------------------------------------------------------------------
+
+async function fetchRemoteEnvironments({ base, project, headers, timeout }) {
+  const out = [];
+  for (let page = 1; page <= 10; page++) {
+    const r = await request(`${base}/api/v1/projects/${project}/environments?page=${page}&perPage=100`, {
+      headers, timeout,
+    });
+    if (r.status !== 200 || !r.json?.success || !Array.isArray(r.json.data)) {
+      throw new Error(`读取环境列表失败 HTTP ${r.status}`);
+    }
+    out.push(...r.json.data);
+    const meta = r.json.meta || {};
+    if (!meta.total || out.length >= meta.total || r.json.data.length < 100) break;
+  }
+  return out;
+}
+
+// 从 openapi.yaml 的 servers 块读前置 URL：swag 注解 @servers.description 就是 Apifox 环境名。
+function parseServers(yaml) {
+  const lines = yaml.split(/\r?\n/);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^servers:\s*(?:#.*)?$/.test(lines[i])) { start = i + 1; break; }
+  }
+  if (start < 0) return [];
+  const out = [];
+  let cur = null;
+  for (let i = start; i < lines.length; i++) {
+    const raw = lines[i];
+    if (raw && /^\S/.test(raw) && !raw.startsWith('-')) break; // 遇到下一个顶层键，`- ` 是列表项不算
+    let line = raw;
+    const item = line.match(/^\s*-\s*(.*)$/);
+    if (item) { cur = {}; out.push(cur); line = item[1]; }
+    if (!cur) continue;
+    const kv = line.match(/^\s*(description|url)\s*:\s*(.*?)\s*$/);
+    if (!kv) continue;
+    let v = kv[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    cur[kv[1]] = v;
+  }
+  return out.filter((s) => s.url);
+}
+
+async function refreshEnvPreUrls({ base, project, headers, timeout, yaml }) {
+  const servers = parseServers(yaml || '');
+  const envs = await fetchRemoteEnvironments({ base, project, headers, timeout });
+  let updated = 0;
+  let skipped = 0;
+
+  // 写入环境前置 URL：baseUrl + baseUrls 全部键都统一，不再区分模块。
+  const putEnv = async (cur, baseUrl, baseUrls, label) => {
+    const payload = {
+      name: cur.name,
+      type: cur.type,
+      visibility: cur.visibility,
+      baseUrl,
+      baseUrls,
+      websocketBaseUrls: cur.websocketBaseUrls || {},
+      socketioBaseUrls: cur.socketioBaseUrls || {},
+      variables: cur.variables || [],
+      parameters: cur.parameters || {},
+      registrationCenters: cur.registrationCenters || [],
+      requestProxyAgentSettings: cur.requestProxyAgentSettings || {},
+      tags: cur.tags || [],
+      ordering: cur.ordering || 0,
+    };
+    const put = await request(`${base}/api/v1/projects/${project}/environments/${cur.id}`, {
+      method: 'PUT', body: JSON.stringify(payload), headers, timeout,
+    });
+    if (put.status < 200 || put.status >= 300 || !put.json?.success) {
+      skipped++;
+      console.warn(`[env] 环境 ${label} PUT HTTP ${put.status} ${put.json?.errorMessage || ''}`);
+      return false;
+    }
+    updated++;
+    return true;
+  };
+
+  for (const listed of envs) {
+    // Mock 环境由 Apifox 自动管理，不动；只处理普通环境。
+    if (listed.type && listed.type !== 'normal') continue;
+
+    const detail = await request(`${base}/api/v1/projects/${project}/environments/${listed.id}`, {
+      headers, timeout,
+    });
+    if (detail.status !== 200 || !detail.json?.success || !detail.json.data) {
+      skipped++;
+      console.warn(`[env] 读取环境 ${listed.name} 失败 HTTP ${detail.status}`);
+      continue;
+    }
+    const cur = detail.json.data;
+    const baseUrls = { ...(cur.baseUrls || {}) };
+
+    // 首选：swag servers 里 description 与环境名相同的 url；单条且无 description 时作为全局默认。
+    const named = servers.find((s) => s.description && s.description === listed.name)
+      || servers.find((s) => s.description && (listed.name.includes(s.description) || s.description.includes(listed.name)))
+      || (servers.length === 1 && !servers[0].description ? servers[0] : null);
+
+    if (named) {
+      const target = named.url;
+      const changed = [];
+      if ((cur.baseUrl || '') !== target) changed.push('baseUrl');
+      for (const k of Object.keys(baseUrls)) {
+        if (baseUrls[k] !== target) { baseUrls[k] = target; changed.push(k); }
+      }
+      for (const k of ['0', 'default']) {
+        if (!baseUrls[k]) { baseUrls[k] = target; changed.push(k); }
+      }
+      if (!changed.length) continue;
+      if (await putEnv(cur, target, baseUrls, listed.name)) {
+        console.log(`[env] ${listed.name} 按 servers 同步前置 URL（${changed.join('、')} = ${target}）`);
+      }
+      continue;
+    }
+
+    // 兜底：本地文档没有 servers 信息时，沿用「从已有模块 URL 复制」补无模块键。
+    const moduleUrls = Object.entries(baseUrls)
+      .filter(([k, v]) => /^\d+$/.test(k) && k !== '0' && Number(k) > 0 && typeof v === 'string' && v.trim())
+      .map(([, v]) => v);
+    const uniq = [...new Set(moduleUrls)];
+    if (uniq.length !== 1) {
+      if (!uniq.length) continue; // 没有模块前置 URL，无需补
+      skipped++;
+      console.warn(`[env] 环境 ${listed.name} 有多个模块前置 URL，跳过自动补全`);
+      continue;
+    }
+    const fallback = uniq[0];
+    const changed = [];
+    for (const key of ['0', 'default']) {
+      if (!baseUrls[key]) { baseUrls[key] = fallback; changed.push(key); }
+    }
+    if (!changed.length) continue;
+    if (await putEnv(cur, cur.baseUrl || '', baseUrls, listed.name)) {
+      console.log(`[env] 已补 ${listed.name} 的无模块前置 URL（${changed.join('、')} = ${fallback}）`);
+    }
+  }
+
+  console.log(`[env] 完成：更新 ${updated} / 跳过 ${skipped}`);
   return { updated, skipped };
 }
 
@@ -1344,10 +1700,11 @@ async function main() {
       const ops = parseLocalOperations(yaml);
       console.log(`[dry-run] 本地解析到接口 ${ops.size} 个，正式执行时会核对并刷新其中与 Apifox 有差异的名称/说明/响应说明/参数定义`);
     }
+    if (!args['no-refresh-apis']) {
+      console.log('[dry-run] 正式执行时会核对并补全环境的无模块前置 URL');
+    }
     return;
   }
-
-  console.log(`[import] POST ${base}/api/v1/projects/${project}/import-data`);
   const result = await request(`${base}/api/v1/projects/${project}/import-data`, {
     method: 'POST', body, headers: h, timeout,
   });
@@ -1403,10 +1760,20 @@ async function main() {
     } else {
       const only = String(opts.apis || '').split(',').map((s) => s.trim()).filter(Boolean);
       try {
-        await refreshApis({ base, project, headers: h, timeout, ops, opts, only });
+        await refreshApis({ base, project, headers: h, timeout, ops, schemas: parseLocalSchemas(yaml), opts, only });
       } catch (err) {
         console.warn(`[warn] 接口元数据刷新失败（接口已导入成功）：${err.message}`);
       }
+    }
+  }
+
+  // 直接采用 openapi.yaml 里 swag 生成的 servers：description 对应 Apifox 环境名，
+  // url 写入该环境全部前置 URL 位置，与模块无关（导入新建的接口 moduleId=0 也能取到）。
+  if (!args['no-refresh-env']) {
+    try {
+      await refreshEnvPreUrls({ base, project: opts.project, headers: h, timeout, yaml });
+    } catch (err) {
+      console.warn(`[warn] 环境前置 URL 同步失败（接口已导入成功）：${err.message}`);
     }
   }
 

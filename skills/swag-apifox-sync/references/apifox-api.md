@@ -27,7 +27,7 @@
 ```
 GET https://api.apifox.com/api/v1/projects/{projectId}
 Headers: Authorization / X-apifox-cli-version / X-apifox-Api-Version / X-Project-Id
-→ 200 {"success":true,"data":{"id":123456,"name":"示例项目","teamId":789,"..."}}
+→ 200 {"success":true,"data":{"id":9012981,"name":"云出纳","teamId":3337384,...}}
 ```
 
 ### 导入 OpenAPI
@@ -82,7 +82,7 @@ GET https://api.apifox.com/api/v1/projects/{projectId}/http-apis?page=1&perPage=
 `{"success":false,...,"message":"Request failed with status code 400"}`，`whoami` 还提示「尚未登录」。
 
 排查结论：
-- 不是令牌失效：同一令牌直接请求 `GET /api/v1/user` 返回 200 并返回账号资料，`GET /api/v1/projects/{projectId}` 也返回 200。
+- 不是令牌失效：同一令牌直接请求 `GET /api/v1/user` 返回 200 并返回账号资料，`GET /api/v1/projects/9012981` 也返回 200。
 - 不是网络：curl 走代理与 `--noproxy` 直连都能到达服务器。
 - 因此是 CLI 版本与后端接口不兼容（CLI 发行于 2026-08，本机系统时间 2026-11）。
 - 应对：不要反复重试 CLI 命令，直接用本技能的脚本走 HTTP；或者升级 CLI（`npm i -g apifox-cli@latest`）后重新验证。
@@ -211,6 +211,10 @@ Body（白名单，字段从 GET 单条结果取回原值，只替换要改的�
 - `parameters` 是**对象**（`{path, query, cookie, header}`）不是数组；`responses` 是数组，每项带
   `id / code / jsonSchema.$ref / description`。只改 `description`，`$ref`、响应 id、文件夹归属
   （`folderId`）、`status` 原样传回，实测 PUT 后这些字段全部未变。
+- 响应项的 `name` 是 tab / Mock 列表上显示的名字，与 `description` 是两个字段。Apifox 内置了部分状态码的中文名
+  （200 成功、400 请求有误、401 没有权限、500 服务器错误、502 网关错误），但 409 的 `name` 是空串，
+  所以 tab 上 409 显示空白。修复：线上 `name` 为空、本地 `@Failure` description 非空时，
+  把 description 写进 `name`（只补不清，有值的名称不覆盖）。实测（2026-11-25）409 补成「业务校验失败」后 tab 正常显示。
 - 同样要带 `/projects/{projectId}` 前缀（`PUT /api/v1/http-apis/{id}` 未验证，别试）。
 - 「只补不清」：本地描述为空时**不要** PUT 空字符串，否则会把在 Apifox 手工补的说明冲掉。
 - 新增查询参数同理：`parameters` 是 `{path:[], query:[], cookie:[], header:[]}`。按 `in + name` 比对，
@@ -222,6 +226,23 @@ Body（白名单，字段从 GET 单条结果取回原值，只替换要改的�
 实测（2026-11-16）：把 409 说明从「data 为 DetailMsg」改成「msg 为 DetailMsg」后，重新生成 + 导入仍是
 `update 0`，线上描述不变；故意把线上描述改坏，再跑 `--no-generate --no-refresh-schemas`，
 `[apis] 待核对 1 个 → 已更新 ...：接口说明；响应 409 说明`，描述自动修回，参数/请求体/$ref/folder 均未受影响。
+
+## 响应示例（responseExamples，2026-11-25 实测）
+
+- 示例**不在** `responses[]` 里。`GET /api/v1/projects/{projectId}/http-apis/{apiId}` 返回的接口对象
+  有独立的 `responseExamples: []` 数组；本项目当时 207 个接口全为空，导入从未自动生成示例。
+- 用临时接口实测：OpenAPI 的 `responses.200.content.application/json.examples.<key>.value`
+  经 `import-data` 会转成下面这种示例对象（探完立即删除临时接口，未影响现有接口）：
+  - `name` ← example 的 `summary`
+  - `oasKey` ← examples 的 key
+  - `responseId` ← 对应 `responses[]` 项的 `id`（字符串）
+  - `data` ← **格式化后的 JSON 字符串**，不是对象
+  - 另有 `description` / `oasExtensions` / UUID 形式的 `id`
+- swag v2 的 `example(...)` 只作用于参数和模型属性，不会生成响应 examples。因此脚本在 `[apis]`
+  阶段按本地 `components.schemas` 递归拼示例（属性 `example` 优先，`$ref` 递归，`type: 'null'` →
+  `null`），只对 `oneOf` 响应写入 `responseExamples`；PUT 时把整个数组传回，按 `oasKey` 对齐、
+  只补不清，线上手工加的其它示例原样保留。
+- 注意：`import-data` 不更新已有接口的 `responseExamples`，`[apis]` 的 PUT 是唯一落地路径。
 
 ## 覆盖策略的边界
 

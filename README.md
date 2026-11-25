@@ -279,6 +279,9 @@ swag-apifox build -- "--exclude './vendor dir' --parseDepth 1"
    ```
    方括号不只是语法糖：`splitNotWrapped` 只在括号内保留逗号，没有它扩展会被拆成多个键。
 5. **幂等剥离**：每次运行先删掉上一轮生成的 `x-apifox-enum` 块（保留 `enum:`），再重新生成。
+   唯一例外是 operation 节点：它上面的 `enum` 只可能来自接口描述的误判，会连同 `x-apifox-enum` 一起删掉。
+6. **operation 描述不解析成枚举**：接口（有 `responses` 的节点）的 `description` 一律跳过枚举检测。
+   否则 `code=200 成功，code=400 订单不存在` 这类说明会被当成 `enum: [200, 400]`，在 Apifox 接口标题下方渲染出一个错误的枚举框。
 
 默认启用 `example`、`enum`、`nullable` 三个 transformer。Apifox 导出里还有 `x-apifox-name`、`x-apifox-ordering`、`x-apifox-mock`、`x-apifox-orders`、`x-apifox-refs` 等字段，可按下面的方式扩展。
 

@@ -17,12 +17,51 @@ func (t *ApifoxEnum) Name() string { return "enum" }
 
 var reApifoxBlock = regexp.MustCompile(`^(\s*)x-apifox-enum:\s*$`)
 
+// isOperationNode reports whether n is an OpenAPI operation (get/post/...).
+// Such a node has a direct "responses" child, and its "description" is the
+// API description - not an enum label source. Descriptions like "code=200
+// 成功，code=400 订单不存在" must never be turned into operation-level enums.
+func isOperationNode(info *document.NodeInfo) bool {
+	_, ok := info.Props["responses"]
+	return ok
+}
+
 // Strip removes previously generated x-apifox-enum blocks. It deliberately
 // does NOT remove enum: blocks - on a second run those make hasEnum true and
-// prevent a duplicate enum: from being inserted.
+// prevent a duplicate enum: from being inserted. The one exception is an
+// operation node: an enum there can only be a mis-detection from the API
+// description, so it is removed together with x-apifox-enum for idempotency.
 func (t *ApifoxEnum) Strip(doc *document.Document) {
-	var clean []string
 	lines := doc.Lines
+
+	// Mark enum: lists directly under operation nodes for removal. swag never
+	// emits an operation-level enum, so anything there is transformer output.
+	drop := map[int]bool{}
+	for _, n := range document.IndexNodes(lines) {
+		info := document.ReadNode(lines, n)
+		if !isOperationNode(info) {
+			continue
+		}
+		p, ok := info.Props["enum"]
+		if !ok {
+			continue
+		}
+		ind := n.Indent + 2
+		drop[p.Index] = true
+		for j := p.Index + 1; j <= n.End && j < len(lines); j++ {
+			if document.IsBlank(lines[j]) {
+				drop[j] = true
+				continue
+			}
+			if document.Indent(lines[j]) == ind && strings.HasPrefix(strings.TrimSpace(lines[j]), "-") {
+				drop[j] = true
+				continue
+			}
+			break
+		}
+	}
+
+	var clean []string
 	for i := 0; i < len(lines); i++ {
 		if m := reApifoxBlock.FindStringSubmatch(lines[i]); m != nil {
 			k := len(m[1])
@@ -31,6 +70,9 @@ func (t *ApifoxEnum) Strip(doc *document.Document) {
 				j++
 			}
 			i = j - 1
+			continue
+		}
+		if drop[i] {
 			continue
 		}
 		clean = append(clean, lines[i])
@@ -78,6 +120,9 @@ func (t *ApifoxEnum) Apply(ctx *Context) ([]document.Edit, error) {
 	// Step 1: schema-level enums (x-enum-comments + x-enum-varnames).
 	for _, n := range ctx.Nodes {
 		info := document.ReadNode(lines, n)
+		if isOperationNode(info) {
+			continue
+		}
 		comments, hasComments := info.Maps["x-enum-comments"]
 		values, hasEnum := info.Lists["enum"]
 		if !hasComments || !hasEnum {
@@ -114,6 +159,9 @@ func (t *ApifoxEnum) Apply(ctx *Context) ([]document.Edit, error) {
 	// Step 2: field/parameter-level enums.
 	for _, n := range ctx.Nodes {
 		info := document.ReadNode(lines, n)
+		if isOperationNode(info) {
+			continue
+		}
 		if _, done := info.Maps["x-enum-comments"]; done {
 			continue
 		}

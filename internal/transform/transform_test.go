@@ -198,3 +198,51 @@ func TestParamExampleIsIdempotent(t *testing.T) {
 		t.Fatalf("not idempotent:/nfirst:/n%s/nsecond:/n%s", first.Text(), second.Text())
 	}
 }
+
+func TestOperationDescriptionNotTurnedIntoEnum(t *testing.T) {
+	// An operation's description mentioning "200 成功，400 订单不存在" must
+	// never produce operation-level enum / x-apifox-enum blocks.
+	lines := []string{
+		"  /office/user/space:",
+		"    get:",
+		"      description: 官网内网调用，HTTP 恒 200，code=200 成功，code=400 订单不存在，code=500 服务端错误。",
+		"      responses:",
+		"        '200':",
+		"          description: ok",
+		"      summary: 获取购买订单的空间数据",
+	}
+	d, _ := runTransform(t, lines, baseConfig("description"))
+	got := d.Text()
+	if strings.Contains(got, "enum:") || strings.Contains(got, "x-apifox-enum") {
+		t.Fatalf("operation description must not become enum:/n%s", got)
+	}
+}
+
+func TestStripRemovesStaleOperationEnum(t *testing.T) {
+	// A previously mis-generated operation-level enum must be stripped so
+	// re-running the tool is idempotent.
+	lines := []string{
+		"  /office/user/space:",
+		"    get:",
+		"      description: 官网内网调用，HTTP 恒 200，code=200 成功，code=400 订单不存在，code=500 服务端错误。",
+		"      responses:",
+		"        '200':",
+		"          description: ok",
+		"      summary: 获取购买订单的空间数据",
+		"      enum:",
+		"      - 200",
+		"      - 400",
+		"      x-apifox-enum:",
+		"        - value: 200",
+		"          name: ''",
+		"          description: 成功",
+		"        - value: 400",
+		"          name: ''",
+		"          description: 订单不存在",
+	}
+	d, _ := runTransform(t, lines, baseConfig("description"))
+	got := d.Text()
+	if strings.Contains(got, "enum:") || strings.Contains(got, "x-apifox-enum") {
+		t.Fatalf("stale operation enum not stripped:/n%s", got)
+	}
+}

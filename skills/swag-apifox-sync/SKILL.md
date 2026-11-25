@@ -85,6 +85,15 @@ node "$SKILL_DIR/scripts/pipeline.mjs" --project <你的 Apifox 项目 ID>
 
 单次最多刷新 30 个模型（`--max-schemas` 可调）；超出会中止并提示，避免误批量改写。
 
+**数组属性的示例（已修复的拆平 bug，2026-11-24）**：Apifox 模型用 `examples` 存示例列表，
+**每个元素是列表里的一个独立示例**，所以数组示例本身必须作为整体元素——`example: [1,2]`
+（array 类型的一个示例）应写 `examples: [[1,2]]`。旧版脚本误写成 `examples: [1,2]`，
+导致 Apifox 把 1、2 当成两个独立示例：字段类型是 `array[integer]`，示例却显示成 `integer`
+（触发场景：应收应付余额详情的 `attachment_ids`）。已在 `pipeline.mjs` 的 `quickDiffers`
+（快速比对）、`buildPropValue`（新增属性）、`planUpdate`（刷新属性）三处统一按 `[spec.example]`
+包装；线上受影响的模型也已随流水线自动修正。复核方式：`--schemas <模型名>` 定向重跑，
+日志 `[schemas] 待核对 0` 即通过。
+
 ## 接口元数据刷新也已内置
 
 `import-data` 对**已存在**的接口只会「忽略」，所以改了 `@Summary` / `@Description` / `@Failure`
@@ -93,9 +102,37 @@ node "$SKILL_DIR/scripts/pipeline.mjs" --project <你的 Apifox 项目 ID>
 1. 解析本地 `paths`（method + path、summary、description、各状态码 description、parameters）；
 2. 拉 Apifox 接口列表比对（列表项本身就带这些字段，零额外请求）；
 3. 只对有差异的接口 `GET` 单条后 `PUT`：改名称/说明/响应说明，**追加本地新出现的参数**，
-   并**刷新已存在参数的定义**（见下）；请求体、响应 `$ref`、参数 `id`/`enable` 等结构原样传回；
+   并**刷新已存在参数的定义**（见下）；请求体、普通响应 `$ref`、参数 `id`/`enable` 等结构原样传回（多态响应除外，见下）；
 4. **只补不清（针对资源，不针对字段）**：本地 `@Description` 为空时不会把线上已有的说明冲掉；
    本地文档里没有的线上参数保留；参数 `title` 等未管理字段原样保留，`example` 则按本地有值才覆盖。
+
+### 同一状态码多种返回（`oneOf` 响应结构）
+
+一个接口有时需要表达「成功时有数据 / 没数据时 `data: null`」这类多形态返回。**直接在控制器上写两条
+`@Success 200`，不要往描述里手写「未购买时 data 为 null」**：
+
+```go
+//	@Success  200 {object} dto.OkResponse[dto.AttachmentSpaceResponse] "获取成功"
+//	@Success  200 {object} dto.NullResponse "获取成功"
+```
+
+swag 会把同状态码合并成一个 `oneOf`（两个 schema 引用），description 取**最后一条**——
+所以两条描述建议写成一样的，避免整体描述变成误导性的「未购买」。
+
+`import-data` 不会更新已有接口的响应 schema，所以 2026-11-25 起 `[apis]` 阶段会额外同步这一类：
+解析各响应的 `oneOf` 引用 → 用模型名到 Apifox 定义 ID 的映射改写成 `$ref: '#/definitions/<id>'`
+→ 与线上 `jsonSchema.oneOf` 比对，不同才写回。只处理引用数 ≥2 的 `oneOf`，其它响应结构一律不动；
+模型未找到映射时跳过并告警。日志形如 `[apis] 已更新 xxx：响应 200 结构（A / B）`，
+再跑一次应为 `更新 0 / 无需变更 N`。复核可直接读接口详情的 `responses[].jsonSchema.oneOf`。
+
+**响应示例（2026-11-25）**：swag v2 的 `example(...)` 只作用于参数，不会生成响应示例；
+Apifox 把示例存在接口对象的 `responseExamples`（**不在** `responses[]` 里），`import-data`
+也不会给已有接口补。因此 `[apis]` 阶段对同一批 `oneOf` 响应再按本地 `components.schemas`
+递归拼出每个分支的示例 JSON：属性 `example` 优先，`$ref` 递归展开，`type: 'null'` → `null`，
+没有示例的按类型给默认值（`string`/`0`/`false`/`[]`/`{}`）。写入时按 `oasKey`（模型名）对齐、
+**只补不清**，手工加的其它示例不会被删；示例名就是模型名，如
+`dto.OkResponse-dto_AttachmentSpaceResponse`（有数据）与 `dto.NullResponse`（`data: null`）。
+日志形如 `[apis] 已更新 xxx：响应 200 示例 2 个`；复核读接口详情的 `responseExamples[].data`。
 
 ### 已存在参数的差异检测（`[apis]` 第 3 步）
 
@@ -110,6 +147,28 @@ node "$SKILL_DIR/scripts/pipeline.mjs" --project <你的 Apifox 项目 ID>
 
 刷新时只覆盖这几类键，参数 `id`、`enable` 等其它键全部保留；
 参数 `required` 暂不比对（线上可能有人为调整，需要时再加）。
+
+### 接口级 enum（`oasExtensions`，operation 误判清理）
+
+operation 节点（有 `responses`）的 `description` 里如果出现 ≥2 个「数字+中文」组合
+（如 `code=200 成功，code=400 订单不存在`），旧版 `swag-apifox` 的 enum transformer 会
+误把它当成枚举，在 operation 上生成 `enum` + `x-apifox-enum`，导入 Apifox 后落在接口的
+`oasExtensions`（JSON 字符串）里，Apifox 会在接口标题下方渲染出一个莫名其妙的 enum 框。
+
+- 治本：`swag-apifox` 的 enum transformer 已跳过 operation 节点（`internal/transform/apifox_enum.go`
+  的 `isOperationNode`），新生成的文档不会再有这类 enum。
+- 清理：`[apis]` 会比对本地 operation 级 enum 与线上 `oasExtensions.enum`，
+  本地没有就删掉线上的 `enum` / `x-apifox-enum`（其它扩展键原样保留）。
+  日志形如 `[apis] 已更新 get /x：扩展 enum（线上 [200,400] → 本地 []）`。
+
+### 空响应名补中文（409 等，2026-11-25）
+
+Apifox 对部分状态码内置了中文响应名（200 成功、400 请求有误、401 没有权限、500 服务器错误、502 网关错误），
+但 **409 没有内置名**，`responses[].name` 是空串，导致 Mock 列表和「返回响应」tab 上 409 显示为空白。
+`[apis]` 阶段现在会在本地 `@Failure` 的 description 非空、线上 `name` 为空时，把 description 写进 `name`（只补不清，
+已有名称一律不动）。日志形如 `[apis] 已更新 post /x：响应 409 名称`。
+因为 swag 把同状态码多条 `@Failure` 合并成 oneOf、description 取最后一条，想让 409 名称简短，
+就给多条 409 写**相同且简短**的文案（如都写「业务校验失败」），详细说明放到响应 DTO 的 `@Description` 里。
 
 **multipart/form-data 是另一套结构**：Apifox 把表单参数放在
 `requestBody.parameters[]`，示例字段是参数级 `example`（字符串），而不是 `schema.example`。
@@ -138,6 +197,33 @@ Apifox 的 `x-apifox-enum`。实测日志：
 ```
 
 单次最多 50 个接口（`--max-apis` 可调）。这一步失败只告警，不影响已完成的导入。
+
+## 环境前置 URL 同步（`[env]`）
+
+权威数据源是 `openapi.yaml` 的 `servers` 块——由 Go 注解 `@servers.url` / `@servers.description`
+生成，`description` 就是 Apifox 环境名。例如：
+
+```yaml
+servers:
+- description: 本地开发
+  url: http://192.168.2.170:3002/api
+- description: 测试环境
+  url: http://192.168.2.100:3006/api
+```
+
+脚本导入后自动：
+
+1. 解析本地文档的 `servers`，按 `description` 匹配环境名（支持包含匹配；单条无 description 时作为全局默认）；
+2. 拉全量环境列表，只处理 `type=normal` 的普通环境（Mock 环境由 Apifox 自管，不动）；
+3. 把匹配到的 URL 写入该环境的 `baseUrl` 和 `baseUrls` **全部键**（含各模块键、`"0"`、`"default"`），
+   与接口 `moduleId` 无关——OpenAPI 导入新建的 `moduleId=0` 接口也能取到前置 URL；
+4. 有变更才 `PUT`；`--no-refresh-env` 可关闭这一步。只同步 `servers` 明确声明的环境，不猜其它环境。
+
+本地文档没有 `servers` 时兜底：沿用「从环境已有模块 URL 复制」，只补 `baseUrls["0"]` 和
+`baseUrls["default"]` 的空缺，不覆盖已有值。
+
+日志形如 `[env] 本地开发 按 servers 同步前置 URL（baseUrl、8848517、0、default = http://...）`，
+幂等运行时是 `[env] 完成：更新 0 / 跳过 0`。这一步失败只告警，不影响已完成的导入。
 
 ## 注解补示例的约定
 
@@ -175,6 +261,7 @@ query / formData 参数一律写 `example(...)`，否则同步到 Apifox 就是�
 | `--refresh-apis` / `--no-refresh-apis` | 开启 | 导入后是否刷新接口名称/说明/响应说明/参数定义 |
 | `--apis <list>` | — | 只核对指定接口，格式 `"get /path,post /path"` |
 | `--max-apis <n>` | `50` | 单次最多 PUT 多少接口 |
+| `--refresh-env` / `--no-refresh-env` | 开启 | 按 openapi.yaml 的 servers 同步环境前置 URL |
 | `--verify-only` / `--dry-run` | — | 只读校验 / 生成但不发请求 |
 
 环境变量优先级：令牌 `--token` > `APIFOX_ACCESS_TOKEN` > 配置文件；
@@ -203,6 +290,10 @@ query / formData 参数一律写 `example(...)`，否则同步到 Apifox 就是�
   如果是文档内容确实要变，回去改 Go 注解，不要改 yaml。
 - **生成失败**：直接看 swag 的报错（脚本已透传）。先修注解/类型，再重跑。
 - **`找不到生成命令`**：`swag-apifox` 不在 PATH，用 `--swag-cmd` 指定绝对路径。
+- **模型字段「类型 `array[xxx]`，示例却是单个值」**：数组示例被拆平了，`examples` 里应是
+  `[[...]]` 而不是 `[...]`。检查本地 `example:` 是否是数组，再确认 `pipeline.mjs` 三处
+  示例包装用的是 `[spec.example]`（详见「模型刷新已内置」的「数组属性的示例」）；
+  重跑整条流水线即可自动修正线上模型，不要去 Apifox 手工改示例。
 - **CLI 400 / 导入 422 / 模型没刷新 / 项目名不对**：读 `references/apifox-api.md`，里面有请求头、
   分页参数、计数结构、缓存问题、单模型 PUT 结构的实测记录。
 
